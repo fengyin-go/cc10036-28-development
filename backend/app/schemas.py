@@ -29,3 +29,11 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class GapBackfillPayload(BaseModel):
+    """下钻缺层回补动作载荷：缺事实分区可模拟失败或带入外部事实批次。"""
+    gap_id: str = ""
+    fail: bool = False
+    failure_reason: str = ""
+    incoming_rows: list[dict[str, Any]] | None = None

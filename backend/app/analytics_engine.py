@@ -702,6 +702,431 @@ def compute_drill_levels(
 
 
 # ---------------------------------------------------------------------------
+# 下钻空层（缺层）解释与立方分区回补
+#
+# 城市向门店层下钻时可能出现两种“空层”：
+# 1. MISSING_DIMENSION_ATTR 缺维属性：订单/事实已经到达，但事实行的门店维值
+#    为空（门店维属性未回填），门店层无法归位，父行收入仍需保留，记为待归类。
+# 2. MISSING_FACT_PARTITION 缺事实分区：立方在当前父级（城市）的门店层分区
+#    尚未构建，已得到的父级汇总事实保留，其余部分等待分区构建后回补。
+# ---------------------------------------------------------------------------
+
+MISSING_DIMENSION_ATTR = "MISSING_DIMENSION_ATTR"
+MISSING_FACT_PARTITION = "MISSING_FACT_PARTITION"
+
+# 空层原因码 -> 中文解释（空层原因）
+GAP_REASON_LABELS: dict[str, str] = {
+    MISSING_DIMENSION_ATTR: "缺维属性：事实已到达但门店维值缺失，收入暂未归类",
+    MISSING_FACT_PARTITION: "缺事实分区：当前父级的门店层立方分区尚未构建",
+}
+
+# 缺层记录生命周期状态
+GAP_STATUS_PENDING = "待回补"
+GAP_STATUS_CLASSIFIED = "已补齐"
+GAP_STATUS_BUILDING = "构建中"
+GAP_STATUS_FAILED = "构建失败"
+
+# 立方分区状态
+PARTITION_NOT_BUILT = "未构建"
+PARTITION_BUILDING = "构建中"
+PARTITION_FAILED = "构建失败"
+PARTITION_ONLINE = "已上线"
+
+
+@dataclass
+class CubePartition:
+    """立方分区：按「父级维度取值 + 下钻层维度」定位的门店层分区。
+
+    scope 为该分区覆盖的父级标识（例如 {"city": "武汉"}），分区隔离的关键是
+    读取和重试都只匹配本分区 scope，不能把相邻父级（其它城市）的分区带进来。
+    """
+    partition_id: str
+    cube_name: str
+    level_dimension: str
+    scope: dict[str, Any]
+    status: str = PARTITION_NOT_BUILT
+    classified_measures: dict[str, float] = field(default_factory=dict)
+    attempt: int = 0
+    last_error: str = ""
+
+    def scope_matches(self, parent_key: dict[str, Any]) -> bool:
+        """严格按父级标识判定分区归属，杜绝相邻父级分区串入。"""
+        return all(str(self.scope.get(k)) == str(v) for k, v in parent_key.items())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "partition_id": self.partition_id,
+            "cube_name": self.cube_name,
+            "level_dimension": self.level_dimension,
+            "scope": dict(self.scope),
+            "status": self.status,
+            "classified_measures": dict(self.classified_measures),
+            "attempt": self.attempt,
+            "last_error": self.last_error,
+        }
+
+
+@dataclass
+class DrillGapRecord:
+    """下钻缺层记录：聚合空层对应父级事实的缺层数据。
+
+    保留父行已经核算的收入（parent_measures / parent_revenue）与空层原因；
+    classified_measures 为已归位到门店层的金额，pending_measures 为仍需回补、
+    暂不能进入门店层的待归类收入。对账恒等式：
+        parent_measure == classified_measure + pending_measure
+    """
+    gap_id: str
+    cube_name: str
+    parent_dimension: str
+    parent_value: str
+    parent_key: dict[str, Any]
+    level_dimension: str
+    reason_code: str
+    reason_label: str
+    measure_names: list[str]
+    parent_measures: dict[str, float]
+    classified_measures: dict[str, float]
+    pending_measures: dict[str, float]
+    status: str = GAP_STATUS_PENDING
+    partition_id: str = ""
+    history: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def parent_revenue(self) -> float:
+        """父行已经核算的收入（默认取第一个度量，兼容只传金额的调用方）。"""
+        if not self.measure_names:
+            return 0.0
+        return round(float(self.parent_measures.get(self.measure_names[0], 0.0)), 2)
+
+    def reconciliation(self) -> dict[str, float]:
+        """对账：父级金额应等于已归类金额与待归类金额之和。"""
+        return {
+            name: round(
+                float(self.classified_measures.get(name, 0.0))
+                + float(self.pending_measures.get(name, 0.0)),
+                2,
+            )
+            for name in self.measure_names
+        }
+
+    def is_balanced(self, tolerance: float = 0.01) -> bool:
+        for name in self.measure_names:
+            total = float(self.classified_measures.get(name, 0.0)) + float(
+                self.pending_measures.get(name, 0.0)
+            )
+            if abs(total - float(self.parent_measures.get(name, 0.0))) > tolerance:
+                return False
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "gap_id": self.gap_id,
+            "cube_name": self.cube_name,
+            "parent_dimension": self.parent_dimension,
+            "parent_value": self.parent_value,
+            "parent_key": dict(self.parent_key),
+            "level_dimension": self.level_dimension,
+            "reason_code": self.reason_code,
+            "reason_label": self.reason_label,
+            "empty_layer_reason": self.reason_label,
+            "measure_names": list(self.measure_names),
+            "parent_measures": dict(self.parent_measures),
+            "parent_revenue": self.parent_revenue,
+            "classified_measures": dict(self.classified_measures),
+            "pending_measures": dict(self.pending_measures),
+            "status": self.status,
+            "partition_id": self.partition_id,
+            "reconciliation": self.reconciliation(),
+            "balanced": self.is_balanced(),
+            "history": list(self.history),
+        }
+
+
+def is_blank_dimension_value(row: dict[str, Any], dimension: str) -> bool:
+    """判定事实行在某维度上的维值是否缺失（None / 空串 / 空白）。"""
+    if dimension not in row:
+        return True
+    value = row.get(dimension)
+    return value is None or str(value).strip() == ""
+
+
+def find_parent_fact(
+    parent_facts: list[dict[str, Any]],
+    parent_dimension: str,
+    parent_value: str,
+) -> dict[str, Any] | None:
+    """按父级标识从父行事实集合中读出已经核算的父级事实。"""
+    for row in parent_facts:
+        if str(row.get(parent_dimension, "")) == str(parent_value):
+            return row
+    return None
+
+
+def rows_for_parent(
+    fact_rows: list[dict[str, Any]],
+    parent_dimension: str,
+    parent_value: str,
+) -> list[dict[str, Any]]:
+    """只取属于当前父级的事实行；相邻父级的行在入口处即被排除。"""
+    return [
+        row for row in fact_rows
+        if str(row.get(parent_dimension, "")) == str(parent_value)
+    ]
+
+
+def build_drill_gap_record(
+    cube_name: str,
+    parent_dimension: str,
+    parent_value: str,
+    level_dimension: str,
+    measure_names: list[str],
+    parent_facts: list[dict[str, Any]],
+    fact_rows: list[dict[str, Any]],
+    gap_id: str,
+    partitions: list[CubePartition] | None = None,
+) -> DrillGapRecord:
+    """构建城市下钻空层的缺层记录。
+
+    空层原因判定：
+    - 属于当前父级的事实行里存在空门店维值 -> 缺维属性；
+    - 否则若该父级的门店层立方分区未上线/未构建 -> 缺事实分区。
+
+    父行金额来自 parent_facts（已经核算的收入，原样保留）。已归类金额：
+    - 缺维属性：取门店维值非空事实行的 SUM（分区在线，明细可直接归位）；
+    - 缺事实分区：以立方分区已核算度量为准，分区未构建时为 0（明细虽有门店
+      维值但尚未进入门店层）。待归类金额 = 父行金额 - 已归类金额，保证可对账。
+    """
+    parent_key = {parent_dimension: parent_value}
+    parent_fact = find_parent_fact(parent_facts, parent_dimension, parent_value) or {}
+    parent_measures = {
+        name: round(float(parent_fact.get(name, 0.0) or 0.0), 2)
+        for name in measure_names
+    }
+
+    scoped_rows = rows_for_parent(fact_rows, parent_dimension, parent_value)
+    blank_rows = [r for r in scoped_rows if is_blank_dimension_value(r, level_dimension)]
+    has_missing_attr = bool(blank_rows)
+
+    partition = next(
+        (p for p in (partitions or [])
+         if p.scope_matches(parent_key) and p.level_dimension == level_dimension),
+        None,
+    )
+    partition_id = partition.partition_id if partition is not None else ""
+
+    if has_missing_attr:
+        reason_code = MISSING_DIMENSION_ATTR
+    else:
+        reason_code = MISSING_FACT_PARTITION
+
+    # 已归位事实：属于本父级且门店维值非空，按度量求和。
+    classified_rows = [r for r in scoped_rows if not is_blank_dimension_value(r, level_dimension)]
+    row_classified: dict[str, float] = {}
+    for name in measure_names:
+        values = [
+            float(r.get(name, 0.0) or 0.0)
+            for r in classified_rows
+            if r.get(name) is not None
+        ]
+        row_classified[name] = round(sum(values), 2)
+
+    if reason_code == MISSING_DIMENSION_ATTR:
+        # 缺维属性：门店层分区在线，已归位金额直接取非空门店维值事实行。
+        classified_measures = dict(row_classified)
+    else:
+        # 缺事实分区：门店层分区未构建，明细行虽有门店维值也尚未进入门店层，
+        # 已归位金额只能以分区已核算度量为准（未构建分区为 0）。
+        classified_measures = {
+            name: round(float(partition.classified_measures.get(name, 0.0)), 2)
+            if partition is not None else 0.0
+            for name in measure_names
+        }
+
+    pending_measures = {
+        name: round(parent_measures[name] - classified_measures.get(name, 0.0), 2)
+        for name in measure_names
+    }
+
+    return DrillGapRecord(
+        gap_id=gap_id,
+        cube_name=cube_name,
+        parent_dimension=parent_dimension,
+        parent_value=str(parent_value),
+        parent_key=parent_key,
+        level_dimension=level_dimension,
+        reason_code=reason_code,
+        reason_label=GAP_REASON_LABELS[reason_code],
+        measure_names=list(measure_names),
+        parent_measures=parent_measures,
+        classified_measures=classified_measures,
+        pending_measures=pending_measures,
+        status=GAP_STATUS_PENDING,
+        partition_id=partition_id,
+        history=[{
+            "event": "登记缺层",
+            "reason_code": reason_code,
+            "parent_revenue": parent_measures,
+        }],
+    )
+
+
+def find_partition(
+    partitions: list[CubePartition],
+    parent_key: dict[str, Any],
+    level_dimension: str,
+) -> CubePartition | None:
+    """按父级标识关联立方分区；相邻父级分区不会被读出。"""
+    for partition in partitions:
+        if partition.level_dimension == level_dimension and partition.scope_matches(parent_key):
+            return partition
+    return None
+
+
+def backfill_dimension_gap(
+    gap: DrillGapRecord,
+    fact_rows: list[dict[str, Any]],
+    store_value_field: str = "store",
+) -> DrillGapRecord:
+    """缺维属性回补：事实已在本地，补齐门店维值后把待归类收入归位。
+
+    只处理属于当前父级且门店维值原本为空的行，任何相邻父级行都不参与，
+    归位前后父行金额不变（classified + pending 恒等于 parent）。
+    """
+    if gap.reason_code != MISSING_DIMENSION_ATTR:
+        raise ValueError("仅缺维属性缺层支持维值回补")
+
+    scoped_rows = rows_for_parent(fact_rows, gap.parent_dimension, gap.parent_value)
+    moved: dict[str, float] = {name: 0.0 for name in gap.measure_names}
+    backfilled_rows = 0
+    for row in scoped_rows:
+        if not is_blank_dimension_value(row, gap.level_dimension):
+            continue
+        assigned = str(row.get(store_value_field) or "").strip() or f"回补门店_{gap.parent_value}"
+        row[gap.level_dimension] = assigned
+        backfilled_rows += 1
+        for name in gap.measure_names:
+            moved[name] += float(row.get(name, 0.0) or 0.0)
+
+    for name in gap.measure_names:
+        moved[name] = round(moved[name], 2)
+        gap.classified_measures[name] = round(
+            float(gap.classified_measures.get(name, 0.0)) + moved[name], 2
+        )
+        gap.pending_measures[name] = round(
+            float(gap.parent_measures.get(name, 0.0)) - gap.classified_measures[name], 2
+        )
+
+    gap.status = GAP_STATUS_CLASSIFIED
+    gap.history.append({
+        "event": "维值回补",
+        "backfilled_rows": backfilled_rows,
+        "moved_measures": dict(moved),
+    })
+    return gap
+
+
+def retry_fact_partition(
+    gap: DrillGapRecord,
+    partitions: list[CubePartition],
+    incoming_rows: list[dict[str, Any]],
+    *,
+    fail: bool = False,
+    failure_reason: str = "",
+) -> DrillGapRecord:
+    """缺事实分区的立方构建重试。
+
+    重试严格按 gap.parent_key 过滤 incoming_rows：只有当前父级（城市）的事实
+    能进入本门店层分区，相邻父级分区在过滤阶段就被挡在外面。fail=True 模拟
+    构建失败：分区标记失败、缺层保留待回补，金额对账关系不变。
+    """
+    if gap.reason_code != MISSING_FACT_PARTITION:
+        raise ValueError("仅缺事实分区缺层支持分区构建重试")
+
+    partition = find_partition(partitions, gap.parent_key, gap.level_dimension)
+    if partition is None:
+        raise ValueError(
+            f"父级 {gap.parent_key} 的 {gap.level_dimension} 层分区不存在"
+        )
+
+    partition.attempt += 1
+    scoped_rows = [
+        row for row in incoming_rows
+        if all(str(row.get(k, "")) == str(v) for k, v in gap.parent_key.items())
+    ]
+    rejected_rows = len(incoming_rows) - len(scoped_rows)
+
+    if fail:
+        partition.status = PARTITION_FAILED
+        partition.last_error = failure_reason or "立方构建失败"
+        gap.status = GAP_STATUS_FAILED
+        gap.history.append({
+            "event": "构建重试失败",
+            "attempt": partition.attempt,
+            "rejected_adjacent_rows": rejected_rows,
+            "reason": partition.last_error,
+        })
+        return gap
+
+    partition.status = PARTITION_ONLINE
+    partition.last_error = ""
+    added: dict[str, float] = {}
+    for name in gap.measure_names:
+        values = [
+            float(row.get(name, 0.0) or 0.0)
+            for row in scoped_rows if row.get(name) is not None
+        ]
+        added[name] = round(sum(values), 2)
+        partition.classified_measures[name] = round(
+            float(partition.classified_measures.get(name, 0.0)) + added[name], 2
+        )
+
+    for name in gap.measure_names:
+        gap.classified_measures[name] = round(
+            float(gap.classified_measures.get(name, 0.0)) + added[name], 2
+        )
+        gap.pending_measures[name] = round(
+            float(gap.parent_measures.get(name, 0.0)) - gap.classified_measures[name], 2
+        )
+
+    if all(abs(v) < 0.01 for v in gap.pending_measures.values()):
+        gap.status = GAP_STATUS_CLASSIFIED
+    else:
+        gap.status = GAP_STATUS_PENDING
+    gap.history.append({
+        "event": "分区构建重试",
+        "attempt": partition.attempt,
+        "accepted_rows": len(scoped_rows),
+        "rejected_adjacent_rows": rejected_rows,
+        "added_measures": dict(added),
+        "partition_status": partition.status,
+    })
+    return gap
+
+
+def drill_gap_detail(
+    gap: DrillGapRecord,
+    partitions: list[CubePartition],
+) -> dict[str, Any]:
+    """下钻详情页数据：缺层记录关联立方分区，按父级标识读出已得事实与待回补。"""
+    partition = find_partition(partitions, gap.parent_key, gap.level_dimension)
+    return {
+        "gap": gap.to_dict(),
+        "partition": partition.to_dict() if partition is not None else None,
+        "obtained_facts": {
+            "parent_measures": dict(gap.parent_measures),
+            "classified_measures": dict(gap.classified_measures),
+        },
+        "pending_backfill": {
+            "measures": dict(gap.pending_measures),
+            "reason_code": gap.reason_code,
+            "reason_label": gap.reason_label,
+        },
+        "reconciliation": gap.reconciliation(),
+        "balanced": gap.is_balanced(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 查询加速预计算策略
 # ---------------------------------------------------------------------------
 

@@ -12,8 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import ROUTERS
+from app.schemas import GapBackfillPayload
 from app.store import store
 from app.services import service_for
+from app.services.drill_gap_registry import drill_gap_registry
 
 app = FastAPI(title="多维分析查询与指标平台", version="1.0.0")
 
@@ -286,6 +288,89 @@ def scheduler_topology() -> dict[str, Any]:
     if svc is None:
         return {"ok": False, "message": "调度服务未就绪"}
     return svc.topological_order()
+
+
+# ---- 城市下钻空层（缺层解释 / 立方分区回补）----
+
+
+@app.get("/api/analytics/drill-gaps/reasons")
+def drill_gap_reasons() -> dict[str, Any]:
+    """各类空层解释：原因码、中文说明、涉及城市与待回补数量。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    return {"ok": True, "items": drill_gap_registry.empty_layer_explanations()}
+
+
+@app.get("/api/analytics/drill-gaps")
+def drill_gap_list(
+    reason_code: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """下钻缺层清单：保留父行已核算收入与空层原因。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    return svc.list_drill_gaps(reason_code=reason_code, status=status)
+
+
+@app.get("/api/analytics/drill-gaps/{gap_id}")
+def drill_gap_detail_view(gap_id: str) -> dict[str, Any]:
+    """下钻详情页：缺层数据关联立方分区，按父级标识读已得事实与待回补部分。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    return svc.get_drill_gap_detail(gap_id)
+
+
+@app.post("/api/analytics/drill-gaps/{gap_id}/backfill-attribute")
+def drill_gap_backfill_attribute(gap_id: str) -> dict[str, Any]:
+    """缺维属性回补：补齐门店维值，待归类收入归位到门店层。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    return svc.backfill_gap_attribute(gap_id)
+
+
+@app.post("/api/analytics/drill-gaps/{gap_id}/retry-partition")
+def drill_gap_retry_partition(gap_id: str, payload: GapBackfillPayload | None = None) -> dict[str, Any]:
+    """缺事实分区重试：fail=true 模拟构建失败，默认成功并严格隔离相邻父级。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    fail = payload.fail if payload is not None else False
+    failure_reason = payload.failure_reason if payload is not None else ""
+    incoming_rows = payload.incoming_rows if payload is not None else None
+    return svc.retry_gap_partition(
+        gap_id, fail=fail, failure_reason=failure_reason, incoming_rows=incoming_rows,
+    )
+
+
+@app.get("/api/analytics/drill-gaps-reconciliation")
+def drill_gap_reconciliation() -> dict[str, Any]:
+    """对账：父行已算金额 = 已归类金额 + 待归类收入。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    return svc.gap_reconciliation()
+
+
+@app.get("/api/analytics/cube-partitions")
+def cube_partition_list() -> dict[str, Any]:
+    """门店层立方分区视图（按城市父级标识隔离）。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    return svc.list_cube_partitions()
+
+
+@app.post("/api/analytics/drill-gaps/reset")
+def drill_gap_reset() -> dict[str, Any]:
+    """重置下钻缺层演示数据。"""
+    svc = service_for("drill_path")
+    if svc is None:
+        return {"ok": False, "message": "下钻服务未就绪"}
+    return svc.reset_drill_gaps()
 
 
 # ---- 辅助数据生成函数 ----
